@@ -1,0 +1,28 @@
+{
+  "name": "ai-model-evaluation-upgrades",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "vite build",
+    "dev": "node scripts/dev.mjs",
+    "api": "node --env-file=.env.local src/http/server.mjs",
+    "worker": "node --env-file=.env.local src/services/worker.mjs",
+    "ui": "vite --host 127.0.0.1",
+    "verify": "node --env-file=.env.local scripts/verify-connections.mjs",
+    "verify:gepa": "node scripts/verify-gepa.mjs",
+    "migrate": "node --env-file=.env.local scripts/cli.mjs migrate",
+    "data:generate": "node scripts/cli.mjs generate",
+    "data:import": "node --env-file=.env.local scripts/cli.mjs import",
+    "gate": "node --env-file=.env.local scripts/cli.mjs gate",
+    "cli": "node --env-file=.env.local scripts/cli.mjs"
+  },
+  "dependencies": {
+    "oracledb": "26.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": { "vite": "^7.0.0", "esbuild": "0.28.2" }
+}
