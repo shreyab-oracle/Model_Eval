@@ -110,13 +110,102 @@ test('individual outcomes distinguish business failure, human review and process
   const complete={result:{complete:true},tasks:[],outputs};
   assert.match(render(complete),/>Fail</);
   assert.doesNotMatch(render(complete),/>REVIEW</);
-  assert.match(render(complete,{...comparison,candidate:{pass:false,critical:0,pending:1}}),/>REVIEW</);
+  assert.match(render(complete,{...comparison,candidate:{pass:false,critical:0,pending:1}}),/>Needs review</);
   assert.match(render({...complete,result:{complete:false},tasks:[{caseId:'example',role:'candidate',status:'FAILED'}]}),/>Processing problem</);
   assert.equal(render({...complete,result:{complete:false},outputs:[]}), 'Waiting');
   assert.equal(render({...complete,result:{complete:false},outputs:outputs.slice(0,1).map(o=>({...o,judges:[]}))}), 'Waiting for checks');
   assert.match(render({...complete,result:{complete:false},outputs:[{...outputs[0],checks:[{status:'FAIL',confirmed:true}]}]}),/>Fail</);
   assert.match(render({...complete,result:{complete:false},outputs:[{...outputs[0],judges:[],modelContractFailure:{code:'MODEL_JSON_INVALID',message:'Invalid JSON'}}]}),/>Fail</);
   assert.match(render(complete,{...comparison,candidate:{pass:true,critical:0,pending:0}}),/>Pass</);
+});
+
+test('saved explicit case outcomes keep unresolved assessment separate from failed answers',()=>{
+  const bundle={result:{complete:true},tasks:[],outputs:[{caseId:'example',role:'candidate',response:{reply:'Recorded answer'},checks:[],judges:[]}]};
+  const render=assessment=>renderToStaticMarkup(React.createElement(compiled.exports.CaseOutcome,{bundle,comparison:{id:'example',candidate:assessment},role:'candidate'}));
+  assert.match(render({outcome:'NEEDS_REVIEW',pass:false,critical:0,pending:0}),/>Needs review</);
+  assert.match(render({outcome:'FAIL',pass:false,critical:0,pending:1}),/>Fail</);
+  assert.match(render({outcome:'PASS',pass:true,critical:0,pending:0}),/>Pass</);
+});
+
+test('historical case badges use the original saved comparison rather than current findings',()=>{
+  const bundle={historical:true,result:{complete:true},tasks:[],outputs:[{caseId:'example',role:'candidate',modelContractFailure:{code:'MODEL_SCHEMA_INVALID'},response:{reply:'Recorded answer'},checks:[{status:'FAIL',confirmed:true}],judges:[]}]};
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.CaseOutcome,{bundle,comparison:{id:'example',candidate:{pass:true,pending:0,critical:0}},role:'candidate'}));
+  assert.match(html,/>Pass</);assert.doesNotMatch(html,/>Fail</);
+});
+
+test('result summary uses saved three-way counts and explicit denominators instead of a combined failure rate',()=>{
+  const counts={responses:{pass:7,fail:1,needsReview:4,total:12,expected:12,recorded:10,passRate:7/12},cases:{pass:2,fail:1,needsReview:1,total:4,passRate:0.5},reviews:{required:5,resolved:2,pending:3,coverage:0.4}};
+  const bundle={run:{id:'run',status:'COMPLETED'},snapshot:{dataset:{version:'practice',cases:[{},{},{},{}]},datasetKind:'development',modelMetadata:{baseline:{displayName:'Current'},candidate:{displayName:'New'}}},result:{decision:'REVIEW',complete:true,baseline:0.99,candidate:0.99,outcomes:{baseline:counts,candidate:counts},criticalFindings:{confirmedCandidateResponses:1,confirmedCandidateCases:1,pendingCandidateResponses:2,pendingCandidateCases:1},pendingReviews:3,reasons:[],categories:{},comparisons:[]},progress:{done:72,total:72,failed:0,running:0},evidence:{},outputs:[],tasks:[]};
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.RunPage,{bundle,runId:'run',busy:false,boot:{},act:()=>{},request:()=>{}})),visible=html.replace(/<[^>]*>/g,' ');
+  assert.match(visible,/Response pass rate.*58\.3%.*7 of 12 planned responses/s);
+  assert.match(visible,/Pass: 7.*Fail: 1.*Needs review: 4/s);
+  assert.match(visible,/Case pass rate.*50\.0%.*2 of 4 cases/s);
+  assert.match(visible,/Review coverage.*40\.0%.*2 of 5 required reviews resolved/s);
+  assert.match(visible,/10 of 12 responses recorded/);
+  assert.match(visible,/1 confirmed critical response.*1 case/s);
+  assert.match(visible,/2 responses with pending critical findings.*1 case/s);
+  assert.match(visible,/A failed response can also have a pending critical review/);
+  assert.match(visible,/Needs review can mean missing evidence or a disputed assessment/);
+  assert.match(visible,/>?Needs review/);assert.doesNotMatch(visible,/99\.0%/);
+});
+
+test('review actions wait for two valid recorded AI reviews before enabling adjudication',()=>{
+  const render=item=>renderToStaticMarkup(React.createElement(compiled.exports.ReviewActions,{item,reason:'Checked the supporting evidence',setReason:()=>{},onResolve:()=>{},busy:false}));
+  const pending=render({checks:[],reviewReady:false});
+  assert.match(pending,/AI review evidence is still processing/);
+  assert.equal((pending.match(/<button[^>]*disabled/g)||[]).length,3);
+  const ready=render({checks:[],reviewReady:true});
+  assert.equal((ready.match(/<button[^>]*disabled/g)||[]).length,0);
+  const confirmed=render({checks:[{status:'FAIL',confirmed:true}],reviewReady:true});
+  assert.match(confirmed,/<button[^>]*disabled[^>]*>Accept this disputed answer<\/button>/);
+});
+
+test('historical review actions retain the original policy and prevent new decisions',()=>{
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.ReviewActions,{item:{checks:[],historical:true,reviewReady:true,reviewPolicyVersion:'score-difference-v1'},reason:'Original decision',setReason:()=>{},onResolve:()=>{},busy:false}));
+  assert.match(html,/Original review policy: score-difference-v1/);
+  assert.match(html,/Original decisions are retained/);
+  assert.equal((html.match(/<button[^>]*disabled/g)||[]).length,3);
+});
+
+test('legacy result summary preserves original saved rate and marks unavailable outcome counts',()=>{
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.ResultSummary,{result:{complete:true,baseline:0.9,candidate:0.7,criticalCandidateFailures:2,pendingReviews:1},historical:true})),visible=html.replace(/<[^>]*>/g,' ');
+  assert.match(visible,/Original saved case pass rate.*90\.0%.*70\.0%/s);
+  assert.match(visible,/Response outcomes and review coverage were not recorded/);
+  assert.match(visible,/Original saved critical-failure count: 2/);
+  assert.doesNotMatch(visible,/confirmed critical|Response pass rate/);
+});
+
+test('history separates confirmed critical responses from pending findings and preserves older counts',()=>{
+  const row={id:'run',kind:'development',status:'COMPLETED',createdAt:'2026-11-02T10:00:00Z',decision:'REVIEW',models:{baseline:{displayName:'Current'},candidate:{displayName:'New'},judge:{displayName:'Reviewer'}},prompt:{version:'v1'},dataset:'practice',improvements:[],regressions:[],reasons:[],criticalFailures:5,executionErrors:0,pendingReviews:2,progress:{done:18,total:18}};
+  const render=value=>renderToStaticMarkup(React.createElement(compiled.exports.HistoryList,{rows:[value],openRun:()=>{}})).replace(/<[^>]*>/g,' ');
+  const current=render({...row,criticalFindings:{confirmedCandidateResponses:1,confirmedCandidateCases:1,pendingCandidateResponses:2,pendingCandidateCases:1}});
+  assert.match(current,/1 confirmed critical response.*1 case/s);
+  assert.match(current,/2 responses with pending critical findings.*1 case/s);
+  const older=render(row);assert.match(older,/Original saved critical-failure count: 5/);assert.doesNotMatch(older,/5 confirmed/);
+  const archived=renderToStaticMarkup(React.createElement(compiled.exports.HistoryList,{rows:[{...row,historical:true,reviewPolicyVersion:'score-difference-v1'}],openRun:()=>{},setPage:()=>{}}));
+  assert.match(archived,/Original review policy: score-difference-v1/);
+  assert.doesNotMatch(archived,/>Open review list<\/button>/);
+});
+
+test('a complete run without required human reviews labels the zero review denominator',()=>{
+  const counts={responses:{pass:3,fail:0,needsReview:0,total:3,expected:3,recorded:3,passRate:1},cases:{pass:1,fail:0,needsReview:0,total:1,passRate:1},reviews:{required:0,resolved:0,pending:0,coverage:1}};
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.ResultSummary,{result:{outcomes:{baseline:counts,candidate:counts}}})).replace(/<[^>]*>/g,' ');
+  assert.match(html,/Review coverage.*100\.0%.*0 of 0 required reviews; none required/s);
+});
+
+test('guided setup reaches review and retest while advanced reviewer controls stay collapsed',()=>{
+  const boot={configuration:{models:{baseline:'current',candidate:'new',judge:'reviewer'}},datasets:[],prompts:[],policies:[],runs:[],promptApprovals:[]};
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.SetupPage,{boot,request:()=>{},act:()=>{},busy:false,openRun:()=>{}}));
+  assert.match(html,/1\. Choose configuration.*2\. Run evaluation.*3\. Inspect results.*4\. Review or improve.*5\. Retest/s);
+  assert.match(html,/<details><summary>Advanced: business rules and AI reviewer<\/summary>/);
+});
+
+test('individual recorded answers show their saved outcome without treating human review as failure',()=>{
+  const c=generateDataset({kind:'development'}).cases[0];
+  const bundle={snapshot:{dataset:{cases:[c]},modelMetadata:{baseline:{displayName:'Current'},candidate:{displayName:'New'}}},evidence:{labels:false},outputs:[{caseId:c.id,role:'candidate',repeat:0,response:{reply:'Read the supplier response'},checks:[],judges:[],assessment:{outcome:'NEEDS_REVIEW'}}]};
+  const html=renderToStaticMarkup(React.createElement(compiled.exports.InvestigationPage,{bundle,caseId:c.id,setCaseId:()=>{}}));
+  assert.match(html,/>Needs review<\/span>/);
+  assert.match(html,/<details><summary>AI reviewer evidence<\/summary>/);
 });
 
 test('results show frozen model choices, saved instructions and the actual example set',()=>{
@@ -134,6 +223,10 @@ test('results show frozen model choices, saved instructions and the actual examp
   assert.match(visible,/Received answers with invalid format: current model 1; new model 1/);
   assert.match(html,/<button(?![^>]*disabled)[^>]*>Check and save report<\/button>/);
   assert.doesNotMatch(visible,/private-run-id|private-prompt-id|APPROVED/);
+  const archived=renderToStaticMarkup(React.createElement(compiled.exports.RunPage,{bundle:{...bundle,historical:true},runId:bundle.run.id,busy:false,boot:{prompts:[]},act:()=>{},request:()=>{}}));
+  assert.match(archived,/Original historical decision/);assert.match(archived,/new test for current release eligibility/);
+  assert.match(archived,/<button[^>]*disabled[^>]*>Check and save report<\/button>/);
+  assert.match(archived,/<button[^>]*disabled[^>]*>Review findings<\/button>/);
 });
 
 test('a selected test shows loading instead of asking the user to choose again',()=>{

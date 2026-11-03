@@ -21,14 +21,7 @@ try{
     case'cancel':await repository.cancel(opts.run);print({cancelled:true});break;
     case'report':print(await runs.writeReport(opts.run));break;
     case'gate':{
-      if(!opts.run)throw new Error('Gate requires --run <completed-live-run-id>');
-      const b=await runs.comparison(opts.run,{verify:true}),profiles=await import('../src/domain/model-settings.mjs');
-      const expectedSettings=Object.fromEntries(['baseline','candidate','judge'].map(role=>[role,profiles.settingsForModel(b.snapshot.modelMetadata[role],{openai:config.settings,gemini:config.geminiSettings})]));
-      const evaluatedSettings=Object.fromEntries(['baseline','candidate','judge'].map(role=>[role,profiles.validateModelSettings(profiles.settingsForRole(b.snapshot,role))]));
-      const expectedTarget={models:config.models,modes:config.modes,settings:expectedSettings,endpoint:config.genaiEndpoint,compartment:config.compartment};
-      const evaluatedTarget={models:b.snapshot.models,modes:b.snapshot.modes,settings:evaluatedSettings,endpoint:b.snapshot.genaiEndpoint,compartment:b.snapshot.compartmentId};
-      const exitCode=(await import('../src/services/task-policy.mjs')).gateExitCode(b.result,{expectedTarget,evaluatedTarget});
-      print({...b.result,...(b.result.decision==='ELIGIBLE FOR PILOT'&&exitCode?{gateFailure:'The selected evaluation does not match the configured release models, generation settings or connection'}:{})});process.exitCode=exitCode;break;
+      await(await import('./gate-command.mjs')).runGateCommand(opts.run,{print});break;
     }
     case'improve':print(await(await import('../src/services/prompts.mjs')).proposeImprovement({sourceRunId:opts.run,autoRetest:!opts['no-retest'],actor:config.reviewer,limits:{...(opts['max-case-evaluations']?{maxCaseEvaluations:Number(opts['max-case-evaluations'])}:{}),...(opts['max-proposals']?{maxProposals:Number(opts['max-proposals'])}:{})}}));break;
     case'history':print(await(await import('../src/services/history.mjs')).evaluationHistory());break;

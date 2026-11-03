@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "build": "vite build",
@@ -21,8 +23,12 @@
   },
   "dependencies": {
     "oracledb": "26.0.0",
+    "promptfoo": "0.125.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
-  "devDependencies": { "vite": "^7.0.0", "esbuild": "0.28.2" }
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "vite": "^7.0.0"
+  }
 }

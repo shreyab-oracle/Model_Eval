@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseJudgeAssessment,responseRetryDisposition} from '../src/services/worker.mjs';
+import {responseRetryDisposition} from '../src/services/worker.mjs';
+import {parseJudgeAssessment} from '../src/evaluation/assertions.mjs';
 import {retryDisposition} from '../src/services/task-policy.mjs';
 
 test('malformed AI review JSON gets a recorded retryable reviewer error',()=>{

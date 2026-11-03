@@ -9,17 +9,18 @@ import {chatBody,parseChatResponse} from '../oracle/genai.mjs';
 import {ENGINE_DIGEST,assertFrozenEngine} from '../domain/version.mjs';
 import {evaluationTaskSpecs,assertReportReady} from './task-policy.mjs';
 import {decideRun,assessOutput} from '../domain/decision.mjs';
-import {RUBRIC_VERSION} from '../domain/judge.mjs';
+import {RUBRIC_VERSION,REVIEW_POLICY_VERSION} from '../domain/judge.mjs';
 import {datasetById} from './datasets.mjs';
 import {putJSON,getJSON} from '../oracle/storage.mjs';
 import {modelMetadata} from '../oracle/genai.mjs';
-import {workspaceRuns} from './workspace.mjs';
 import {assertOptimizer} from '../optimization/bridge.mjs';
 import {settingsForModel,settingsForRole} from '../domain/model-settings.mjs';
 import {observeModelAnswer,MODEL_ANSWER_HANDLING_VERSION} from './model-answer.mjs';
 import {EXECUTION_PROTOCOL_VERSION,assertExecutionProtocol} from './execution-protocol.mjs';
 import {recoverReceivedAnswers} from './received-recovery.mjs';
 import {receiptDigest} from './response-journal.mjs';
+import {runnerIdentity,assertFrozenRunner} from '../evaluation/version.mjs';
+import {evaluateTask} from '../evaluation/task.mjs';
 
 export async function createRun({datasetId,promptId,policyId,baselineModelId,candidateModelId,judgeModelId,settings,modelSettings:frozenSettings,id=randomUUID(),allowProposed=false}){
   const previous=await repository.run(id);if(previous)return previous;
@@ -35,8 +36,8 @@ export async function createRun({datasetId,promptId,policyId,baselineModelId,can
     metadata[role]={id:m.id,displayName:m.displayName,vendor:m.vendor,version:m.version,lifecycleState:m.lifecycleState};
     modelSettings[role]=settingsForModel(m,{openai:chosen,gemini:config.geminiSettings},frozenSettings?.[role]);
   }
-  const snapshot={schemaVersion:3,executionProtocolVersion:EXECUTION_PROTOCOL_VERSION,runId:id,datasetId,promptId,policyId,datasetDigest:digest(d.dataset),labelDigest:d.labelDigest,promptDigest:digest(prompt.text),policyDigest:digest(policy.policy),models,modes:config.modes,modelMetadata:metadata,settings:chosen,judgeSettings:modelSettings.judge,modelSettings,rubricVersion:RUBRIC_VERSION,judgeCandidateOverlap:models.judge===models.candidate,judgeFamilyOverlap:{baseline:modelSettings.judge.family===modelSettings.baseline.family,candidate:modelSettings.judge.family===modelSettings.candidate.family},repeats:3,assessments:2,datasetKind:d.dataset.kind,compartmentId:config.compartment,genaiEndpoint:config.genaiEndpoint,genaiRegion:config.genaiRegion,dataset:d.dataset,prompt:prompt.text,policy:policy.policy};
-  snapshot.engineDigest=ENGINE_DIGEST;snapshot.judgeTemplates=judgeTemplates(policy.policy);snapshot.judgeTemplateDigest=digest(snapshot.judgeTemplates);
+  const snapshot={schemaVersion:4,runner:runnerIdentity(),executionProtocolVersion:EXECUTION_PROTOCOL_VERSION,runId:id,datasetId,promptId,policyId,datasetDigest:digest(d.dataset),labelDigest:d.labelDigest,promptDigest:digest(prompt.text),policyDigest:digest(policy.policy),models,modes:config.modes,modelMetadata:metadata,settings:chosen,judgeSettings:modelSettings.judge,modelSettings,rubricVersion:RUBRIC_VERSION,judgeCandidateOverlap:models.judge===models.candidate,judgeFamilyOverlap:{baseline:modelSettings.judge.family===modelSettings.baseline.family,candidate:modelSettings.judge.family===modelSettings.candidate.family},repeats:3,assessments:2,datasetKind:d.dataset.kind,compartmentId:config.compartment,genaiEndpoint:config.genaiEndpoint,genaiRegion:config.genaiRegion,dataset:d.dataset,prompt:prompt.text,policy:policy.policy};
+  snapshot.reviewPolicyVersion=REVIEW_POLICY_VERSION;snapshot.engineDigest=ENGINE_DIGEST;snapshot.judgeTemplates=judgeTemplates(policy.policy);snapshot.judgeTemplateDigest=digest(snapshot.judgeTemplates);
   const artifact=await putJSON('snapshots',id,snapshot);await getJSON(artifact);
   const manifestId=await repository.saveDoc({kind:'MANIFEST',parentId:id,value:{snapshot,artifact}}),tasks=[];
   tasks.push(...evaluationTaskSpecs(id,d.dataset.cases));
@@ -83,6 +84,11 @@ export async function verifyBundle(b,{report=true,loadArtifact=getJSON,loadDatas
     const role=output.kind==='OUTPUT'?output.role:'judge';
     const request=chatBody({modelId:b.snapshot.models[role],mode:b.snapshot.modes[role],messages,settings:settingsForRole(b.snapshot,role),compartmentId:b.snapshot.compartmentId});
     if(digest(request)!==trace.requestDigest||digest(trace.requestBody)!==trace.requestDigest||trace.endpoint!==b.snapshot.genaiEndpoint)throw new Error('Frozen request settings/messages differ from the recorded OCI request');
+    if(b.snapshot.runner){
+      const evaluated=await evaluateTask({snapshot:b.snapshot,task:{...task,runId:b.run.id,attemptId:trace.attemptId},
+        loadDocument:async id=>b.outputs.find(o=>o.id===id),receivedResponse:{...parseChatResponse(trace.raw,trace.requestId),raw:trace.raw,requestId:trace.requestId,latencyMs:trace.latencyMs,usage:trace.usage}});
+      if(digest(evaluated.evaluation)!==digest(output.evaluation))throw new Error('Stored Promptfoo assertion evidence differs from the frozen trace');
+    }
     if(output.kind==='OUTPUT'){
       const observed=observeModelAnswer(c,text);
       if(!!observed.modelContractFailure!==!!output.modelContractFailure)throw new Error('Model contract-failure marker differs from the original answer format');
@@ -102,15 +108,33 @@ export async function readSavedReport(b,{loadDocument=repository.doc,loadArtifac
 }
 export async function comparison(id,{verify=false,requireReport=true,verifyCompleted=false}={}){
   const b=await runBundle(id);let verified=false,artifactError,verificationMode='pending',savedReport;
+  if(!isCurrentEvaluation(b.snapshot)){
+    const historical=await historicalComparison(b);
+    return{...b,...historical,progress:progressFor(b),metrics:metricsFor(b)};
+  }
   try{
     if(verify||(verifyCompleted&&b.run.status==='COMPLETED')){verified=await verifyBundle(b,{report:requireReport});verificationMode='full';}
     else if(b.run.status==='COMPLETED'){assertFrozenEngine(b.snapshot);assertExecutionProtocol(b.snapshot);savedReport=await readSavedReport(b);verified=!!savedReport;verificationMode=verified?'saved-report':'pending';}
   }catch(e){artifactError=e.message;}
   const result=decideRun({...b.run,datasetKind:b.snapshot.datasetKind,artifactsVerified:verified},b.snapshot.dataset.cases,b.outputs,b.reviews,b.evidence);
   if(artifactError)result.reasons.unshift(artifactError);
-  const progress={done:b.tasks.filter(t=>t.status==='DONE').length,total:b.tasks.length,failed:b.tasks.filter(t=>t.status==='FAILED').length,running:b.tasks.filter(t=>t.status==='RUNNING').length};
-  const usage=b.outputs.map(o=>o.usage).filter(Boolean),latencies=b.outputs.map(o=>o.latencyMs).filter(Number.isFinite).sort((a,b)=>a-b);
-  return{...b,result,progress,artifactVerification:{verified,mode:verificationMode,reportGeneratedAt:savedReport?.generatedAt||null},metrics:{p95LatencyMs:latencies.length?latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)]:null,usageKnown:usage.length,usageUnknown:b.outputs.length-usage.length}};
+  return{...b,outputs:b.outputs.map(o=>({...o,assessment:assessOutput(o,b.reviews)})),result,progress:progressFor(b),artifactVerification:{verified,mode:verificationMode,reportGeneratedAt:savedReport?.generatedAt||null},metrics:metricsFor(b)};
+}
+const progressFor=b=>({done:b.tasks.filter(t=>t.status==='DONE').length,total:b.tasks.length,failed:b.tasks.filter(t=>t.status==='FAILED').length,running:b.tasks.filter(t=>t.status==='RUNNING').length});
+function metricsFor(b){const usage=b.outputs.map(o=>o.usage).filter(Boolean),latencies=b.outputs.map(o=>o.latencyMs).filter(Number.isFinite).sort((a,b)=>a-b);return{p95LatencyMs:latencies.length?latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)]:null,usageKnown:usage.length,usageUnknown:b.outputs.length-usage.length};}
+export function isCurrentEvaluation(snapshot){try{assertFrozenEngine(snapshot);assertFrozenRunner(snapshot);assertExecutionProtocol(snapshot);return true;}catch{return false;}}
+
+// Historical decisions come from original versioned reports, never today's rules.
+export async function historicalComparison(b,{loadDocument=repository.doc,loadArtifact=getJSON}={}){
+  const doc=b.run.reportId&&await loadDocument(b.run.reportId);
+  let report;
+  if(doc?.kind==='REPORT'&&doc.parentId===b.run.id&&doc.report?.runId===b.run.id&&doc.report.manifestDigest===b.manifest.digest){
+    report=await loadArtifact(doc.artifact);
+    if(digest(report)!==digest(doc.report))throw new Error('Historical report digest mismatch');
+  }
+  const result=report?.result||{decision:'REVIEW',complete:false,total:b.snapshot?.dataset?.cases?.length||0,baseline:0,candidate:0,categories:{},comparisons:[],criticalCandidateFailures:0,pendingReviews:0,reasons:['Historical evaluator evidence has no readable saved decision. Prepare a new run for current eligibility.']};
+  return{result,historical:true,eligibilityRequiresNewRun:true,
+    artifactVerification:{verified:!!report,mode:'historical-report',reportGeneratedAt:report?.generatedAt||null}};
 }
 export async function writeReport(id){
   const b=await runBundle(id);assertReportReady(b);await verifyBundle(b,{report:false});
@@ -121,18 +145,26 @@ export async function writeReport(id){
     modelAnswerHandlingVersion:MODEL_ANSWER_HANDLING_VERSION,modelContractFailures,
     judgeCandidateOverlap:b.snapshot.judgeCandidateOverlap,judgeFamilyOverlap:b.snapshot.judgeFamilyOverlap,
     evidence:b.evidence,result,executionSummary,executionErrors:b.tasks.filter(t=>t.error).map(t=>({id:t.id,error:t.error})),attempts:b.attempts};
+  report.runner=b.snapshot.runner;report.engineDigest=b.snapshot.engineDigest;report.reviewPolicyVersion=b.snapshot.reviewPolicyVersion;
   const artifact=await putJSON('reports',id,report);await getJSON(artifact);
   const docId=await repository.saveDoc({kind:'REPORT',parentId:id,value:{report,artifact}});await repository.setReport(id,docId);
   return{reportId:docId,artifact,result};
 }
-export async function reviewOutput({runId,outputId,resolution,reason,actor}){
+export async function reviewOutput({runId,outputId,resolution,reason,actor},{store=repository}={}){
   if(!['CONFIRM_CRITICAL','ACCEPT_OUTPUT','REJECT_OUTPUT'].includes(resolution)||!reason?.trim())throw new Error('Review resolution and rationale required');
-  const output=await repository.doc(outputId);if(!['OUTPUT','GEPA_OUTPUT'].includes(output?.kind)||output.parentId!==runId)throw new Error('Output does not belong to this run');
+  const output=await store.doc(outputId);if(!['OUTPUT','GEPA_OUTPUT'].includes(output?.kind)||output.parentId!==runId)throw new Error('Output does not belong to this run');
+  const judges=output.kind==='GEPA_OUTPUT'?output.judges:(await store.docs('JUDGE',runId)).filter(j=>j.outputId===outputId).map(j=>({...j.assessmentResult,assessment:j.assessment}));
+  if(judges?.length!==2||![0,1].every(slot=>judges.some(j=>j.assessment===slot)))throw new Error('Wait for two valid committed judge assessments before adjudication');
+  try{for(const j of judges)validateJudge(j,output.response);}catch{throw new Error('Wait for two valid committed judge assessments before adjudication');}
+  const run=await store.run(runId),manifest=await store.doc(run.manifestId);
+  if(!isCurrentEvaluation(manifest.snapshot.source||manifest.snapshot))throw new Error('Historical evidence retains its original decision; create a new run before current review');
   if(resolution==='ACCEPT_OUTPUT'&&output.checks.some(c=>c.status!=='PASS'&&c.confirmed))throw new Error('Human acceptance cannot waive deterministic policy or calculation failures');
-  if(resolution==='ACCEPT_OUTPUT'&&(await repository.docs('REVIEW',runId)).some(r=>r.outputId===outputId&&r.resolution==='CONFIRM_CRITICAL'))throw new Error('A confirmed critical finding is permanent for this run and cannot be waived by later acceptance');
-  return repository.saveDoc({kind:'REVIEW',parentId:runId,value:{outputId,resolution,reason,actor}});
+  if(resolution==='ACCEPT_OUTPUT'&&(await store.docs('REVIEW',runId)).some(r=>r.outputId===outputId&&r.resolution==='CONFIRM_CRITICAL'))throw new Error('A confirmed critical finding is permanent for this run and cannot be waived by later acceptance');
+  return store.saveDoc({kind:'REVIEW',parentId:runId,value:{outputId,resolution,reason,actor}});
 }
-export async function reviewQueue(){const queue=[];for(const r of await workspaceRuns()){
+export async function reviewQueue(){const queue=[];for(const r of await repository.runs()){
   const optimization=r.kind==='improvement',b=optimization?{outputs:await repository.docs('GEPA_OUTPUT',r.id),reviews:await repository.docs('REVIEW',r.id)}:await runBundle(r.id);
-  for(const o of b.outputs){const a=assessOutput(o,b.reviews);if(a.pending||a.critical)queue.push({runId:r.id,outputId:o.id,caseId:o.caseId,role:o.role,repeat:o.repeat,optimization,...a,checks:o.checks,judges:o.judges,...(optimization?{caseFacts:o.caseFacts,response:o.response,promptDigest:o.promptDigest}:{})});}
+  const source=optimization?(await repository.doc(r.manifestId))?.snapshot?.source:b.snapshot;
+  const historical=!isCurrentEvaluation(source||{}),reviewPolicyVersion=source?.reviewPolicyVersion||'score-difference-v1';
+  for(const o of b.outputs){const a=assessOutput(o,b.reviews,{reviewPolicyVersion});let reviewReady=!historical&&!!o.response&&!o.error&&o.judges?.length===2&&[0,1].every(slot=>o.judges.some(j=>j.assessment===slot));try{if(reviewReady)for(const j of o.judges)validateJudge(j,o.response);}catch{reviewReady=false;}if(a.pending||a.critical)queue.push({runId:r.id,outputId:o.id,caseId:o.caseId,role:o.role,repeat:o.repeat,optimization,historical,reviewReady,reviewPolicyVersion,...a,checks:o.checks,judges:o.judges,...(optimization?{caseFacts:o.caseFacts,response:o.response,promptDigest:o.promptDigest}:{})});}
 }return queue;}

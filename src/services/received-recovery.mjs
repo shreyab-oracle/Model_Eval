@@ -10,6 +10,7 @@ import {evaluationTaskSpecs} from './task-policy.mjs';
 import {assertExecutionProtocol} from './execution-protocol.mjs';
 import {observeModelAnswer,MODEL_ANSWER_HANDLING_VERSION} from './model-answer.mjs';
 import {responseJournal} from './response-journal.mjs';
+import {evaluateTask} from '../evaluation/task.mjs';
 
 const same=(a,b)=>digest({value:a})===digest({value:b});
 const requireThat=(ok,message)=>{if(!ok)throw Object.assign(new Error(message),{code:'RECEIVED_RECOVERY_MISMATCH'});};
@@ -70,7 +71,12 @@ async function observedDocument(context,task,trace,store){
   requireThat(typeof trace.requestId==='string'&&trace.requestId.trim(),'Journal request identifier is missing');
   const parsed=parseChatResponse(trace.raw,trace.requestId);
   let value;
-  if(task.stage==='GENERATE')value={caseId:task.caseId,role:task.role,repeat:task.repeat,...observeModelAnswer(c,parsed.text)};
+  if(snapshot.runner){
+    const evaluated=await evaluateTask({snapshot,task:{...task,attemptId:trace.attemptId},loadDocument:id=>store.doc(id),
+      receivedResponse:{...parsed,raw:trace.raw,requestId:trace.requestId,latencyMs:trace.latencyMs,usage:trace.usage}});
+    value={...evaluated.value,evaluation:evaluated.evaluation};
+  }
+  else if(task.stage==='GENERATE')value={caseId:task.caseId,role:task.role,repeat:task.repeat,...observeModelAnswer(c,parsed.text)};
   else{
     let assessmentResult;
     try{assessmentResult=validateJudge(parseJSON(parsed.text),output.response);}

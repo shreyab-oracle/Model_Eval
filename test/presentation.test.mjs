@@ -19,3 +19,10 @@ test('outdated reports cannot be downloaded as the current result',()=>{
   assert.throws(()=>view.currentReport({current:false,report:{decision:'ELIGIBLE FOR PILOT'}}),/out of date/i);
   const report={decision:'REVIEW'};assert.equal(view.currentReport({current:true,report}),report);
 });
+test('business decisions and unresolved answer outcomes have distinct readable labels',()=>{
+  assert.equal(view.stateLabel('BLOCK'),'Upgrade blocked');
+  assert.equal(view.stateLabel('REVIEW'),'Needs review');
+  assert.equal(view.stateLabel('NEEDS_REVIEW'),'Needs review');
+  assert.equal(view.stateLabel('ELIGIBLE FOR PILOT'),'Eligible for pilot');
+  assert.equal(view.stateLabel('FAIL'),'Fail');
+});

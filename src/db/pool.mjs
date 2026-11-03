@@ -9,7 +9,7 @@ async function getPool(){
   if(!pool){const d=getDriver(),creating=d.createPool({user:required('DB_USER'),password:required('DB_PASSWORD'),connectString:required('DB_CONNECT_STRING'),configDir:path.resolve(required('DB_WALLET_DIR')),walletLocation:path.resolve(required('DB_WALLET_DIR')),walletPassword:required('DB_WALLET_PASSWORD'),poolMin:2,poolMax:2,poolIncrement:1,queueTimeout:20000,connectTimeout:20,retryCount:0,poolPingInterval:30,poolPingTimeout:5000});pool=creating;creating.catch(()=>{if(pool===creating)pool=undefined;});}
   return pool;
 }
-export function connectionInterrupted(error){return error?.isRecoverable===true||['NJS-040','NJS-500','NJS-501','NJS-503','NJS-510','DB_OPERATION_TIMEOUT','ECONNRESET','ECONNABORTED','ENETUNREACH','EHOSTUNREACH','ETIMEDOUT','EAI_AGAIN'].includes(error?.code);}
+function connectionInterrupted(error){return error?.isRecoverable===true||['NJS-040','NJS-500','NJS-501','NJS-503','NJS-510','DB_OPERATION_TIMEOUT','ECONNRESET','ECONNABORTED','ENETUNREACH','EHOSTUNREACH','ETIMEDOUT','EAI_AGAIN'].includes(error?.code);}
 async function deadline(work,ms,onTimeout){
   let timer;
   try{return await Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>{onTimeout?.();reject(Object.assign(new Error(`Database operation exceeded ${ms} ms; its commit outcome must be checked before retrying a write`),{code:'DB_OPERATION_TIMEOUT'}));},ms);})]);}

@@ -1,6 +1,6 @@
 import {repository} from '../db/repository.mjs';
 import {digest,modelInput} from '../domain/policy.mjs';
-import {parseJSON,checkOutput,validateModelResponse} from '../domain/checks.mjs';
+import {parseJSON,validateModelResponse} from '../domain/checks.mjs';
 import {judgeInput,validateJudge} from '../domain/judge.mjs';
 import {assessOutput} from '../domain/decision.mjs';
 import {selectOptimizationCandidate} from '../domain/optimization.mjs';
@@ -10,6 +10,7 @@ import {chat} from '../oracle/genai.mjs';
 import {getJSON,putJSON} from '../oracle/storage.mjs';
 import {IMPROVEMENT_INSTRUCTIONS,validateProposal} from '../services/prompts.mjs';
 import {settingsForRole} from '../domain/model-settings.mjs';
+import {evaluateRequest} from '../evaluation/adapter.mjs';
 
 function evaluationValidator(c,response){
   const judging=response!==undefined;
@@ -33,26 +34,33 @@ function evaluationValidator(c,response){
   };
 }
 
-export async function evaluateOptimizationCase({snapshot,jobId,text,c,invoke,store=repository}){
+export async function evaluateOptimizationCase({snapshot,jobId,text,c,invoke,store=repository,guard=async()=>{}}){
   const source=snapshot.source,outputs=[];
   for(let repeat=0;repeat<3;repeat++){
     const id=digest({jobId,text,caseId:c.id,repeat}),old=await store.doc(id);
     if(old){outputs.push(old);continue;}
-    const response=await invoke(`generate/${c.id}/${repeat}`,{modelId:source.models.candidate,mode:source.modes.candidate,messages:modelInput(c,text,source.policy),settings:settingsForRole(source,'candidate'),compartmentId:source.compartmentId,endpoint:source.genaiEndpoint},evaluationValidator(c));
-    let parsed=null;try{parsed=parseJSON(response.text);}catch(error){if(!response.evaluationError)throw error;}
-    const checks=response.evaluationError?checkOutput(c,parsed):validateModelResponse(c,parsed),judges=[],judgeErrors=[];
+    const generated=await evaluateRequest({stage:'GENERATE',c,guard,identity:{taskId:id,role:'candidate',repeat},
+      request:{modelId:source.models.candidate,mode:source.modes.candidate,messages:modelInput(c,text,source.policy),settings:settingsForRole(source,'candidate'),compartmentId:source.compartmentId,endpoint:source.genaiEndpoint},
+      call:request=>invoke(`generate/${c.id}/${repeat}`,request,evaluationValidator(c))});
+    const response=generated.response,parsed=generated.value.modelContractFailure?.code==='INVALID_MODEL_JSON'?null:generated.value.response;
+    const checks=generated.value.checks,judges=[],judgeErrors=[],judgeEvaluations=[];
     if(!response.evaluationError)for(let assessment=0;assessment<2;assessment++){
-      const judged=await invoke(`judge/${c.id}/${repeat}/${assessment}`,{modelId:source.models.judge,mode:source.modes.judge,messages:judgeInput(c,parsed,assessment,source.policy,source.judgeTemplates),settings:settingsForRole(source,'judge'),compartmentId:source.compartmentId,endpoint:source.genaiEndpoint},evaluationValidator(c,parsed));
+      const assessed=await evaluateRequest({stage:'JUDGE',c,evaluatedOutput:parsed,invalidJudgmentAsFeedback:true,guard,
+        identity:{taskId:digest({id,assessment}),role:'candidate',repeat,assessment},
+        request:{modelId:source.models.judge,mode:source.modes.judge,messages:judgeInput(c,parsed,assessment,source.policy,source.judgeTemplates),settings:settingsForRole(source,'judge'),compartmentId:source.compartmentId,endpoint:source.genaiEndpoint},
+        call:request=>invoke(`judge/${c.id}/${repeat}/${assessment}`,request,evaluationValidator(c,parsed))});
+      const judged=assessed.response;judgeEvaluations.push(assessed.evaluation);
       if(judged.evaluationError)judgeErrors.push({assessment,error:judged.evaluationError,rawText:judged.text,trace:judged.trace});
-      else judges.push({...validateJudge(parseJSON(judged.text),parsed),assessment});
+      else judges.push({...assessed.value.assessmentResult,assessment});
     }
-    const value={caseId:c.id,role:'candidate',repeat,response:parsed,checks,judges,judgeErrors,promptDigest:digest(text),caseFacts:c,latencyMs:response.latencyMs,usage:response.usage,trace:response.trace,
+    await guard();
+    const value={caseId:c.id,role:'candidate',repeat,response:parsed,checks,judges,judgeErrors,evaluation:generated.evaluation,judgeEvaluations,promptDigest:digest(text),caseFacts:c,latencyMs:response.latencyMs,usage:response.usage,trace:response.trace,
       ...(response.evaluationError?{error:response.evaluationError,rawText:response.text}:judgeErrors.length?{error:judgeErrors[0].error}:{})};
     await store.saveDoc({id,kind:'GEPA_OUTPUT',parentId:jobId,value});outputs.push({id,...value});
   }
   const assessments=outputs.map(o=>assessOutput(o));
   const executionErrors=outputs.reduce((n,o)=>n+(o.error?Math.max(1,o.judgeErrors?.length||0):0),0);
-  const value={text,caseId:c.id,attempted:outputs.length===3,complete:outputs.length===3&&executionErrors===0&&outputs.every(o=>o.response&&o.judges.length===2),executionErrors,pass:assessments.every(a=>a.pass),critical:assessments.some(a=>a.critical||a.flagged),pending:assessments.some(a=>a.pending||a.disagreement),outputIds:outputs.map(o=>o.id),feedback:{facts:c,outputs:outputs.map(o=>({repeat:o.repeat,response:o.response,checks:o.checks,judges:o.judges,...(o.error?{error:o.error,rawText:o.rawText,judgeErrors:o.judgeErrors}:{} )}))}};
+  const value={text,caseId:c.id,attempted:outputs.length===3,complete:outputs.length===3&&executionErrors===0&&outputs.every(o=>o.response&&o.judges.length===2),executionErrors,pass:assessments.every(a=>a.pass),critical:assessments.some(a=>a.critical||a.flagged),pending:assessments.some(a=>a.pending||a.disagreement),outputIds:outputs.map(o=>o.id),feedback:{facts:c,outputs:outputs.map(o=>({repeat:o.repeat,response:o.response,checks:o.checks,judges:o.judges,evaluation:o.evaluation,...(o.error?{error:o.error,rawText:o.rawText,judgeErrors:o.judgeErrors}:{} )}))}};
   await store.saveDoc({id:digest({jobId,text,caseId:c.id}),kind:'GEPA_EVALUATION',parentId:jobId,value});return value;
 }
 
@@ -69,7 +77,7 @@ export async function optimizePrompt(snapshot,task,{isAlive=()=>true,signal}={})
       if(!Array.isArray(request.caseIds)||!request.caseIds.length||new Set(request.caseIds).size!==request.caseIds.length||request.caseIds.some(id=>!source.dataset.cases.some(c=>c.id===id)))throw new Error('GEPA requested invalid development cases');
       if(evaluated+request.caseIds.length>snapshot.optimizer.limits.maxCaseEvaluations)throw new Error('GEPA case evaluation limit exceeded');
       evaluated+=request.caseIds.length;const rows=[];
-      for(const id of request.caseIds){await guard();rows.push(await evaluateOptimizationCase({snapshot,jobId:task.runId,text:request.text,c:source.dataset.cases.find(c=>c.id===id),invoke}));}
+      for(const id of request.caseIds){await guard();rows.push(await evaluateOptimizationCase({snapshot,jobId:task.runId,text:request.text,c:source.dataset.cases.find(c=>c.id===id),invoke,guard}));}
       return{rows};
     }
     if(++proposed>snapshot.optimizer.limits.maxProposals)throw new Error('GEPA proposal limit exceeded');

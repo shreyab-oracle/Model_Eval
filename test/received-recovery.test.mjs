@@ -9,6 +9,8 @@ import {ENGINE_DIGEST} from '../src/domain/version.mjs';
 import {judgeTemplates,judgeInput} from '../src/domain/judge.mjs';
 import {evaluationTaskSpecs} from '../src/services/task-policy.mjs';
 import {chatBody} from '../src/oracle/genai.mjs';
+import {runnerIdentity} from '../src/evaluation/version.mjs';
+import * as worker from '../src/services/worker.mjs';
 
 function fixture({stage='GENERATE',text,sourceStatus='FAILED'}={}){
   const dataset=generateDataset({kind:'development'});dataset.cases=dataset.cases.slice(0,1);
@@ -58,6 +60,38 @@ test('a failed generation recovers its exact first received answer without a mod
   const f=fixture();assert.deepEqual(await recoverReceivedAnswers(f.runId,f.io),{recovered:1,alreadyCommitted:0,retiredInvalidJudges:0});
   const output=f.documents.get(f.task.id);assert.deepEqual(output.response,f.response);assert.equal(output.sourceAttemptId,f.source.id);assert.equal(output.handlingVersion,MODEL_ANSWER_HANDLING_VERSION);
   assert.equal(f.source.status,'FAILED');assert.equal(f.attempts[1].modelCall,false);assert.equal(f.entries.length,0);assert.equal(f.actions.at(-1),'clear');assert.ok(f.actions.indexOf('write-trace')<f.actions.indexOf('commit'));assert.ok(f.actions.indexOf('commit')<f.actions.lastIndexOf(`read:unit/traces/${f.source.id}`));
+});
+
+for(const stage of ['GENERATE','JUDGE'])test(`Promptfoo ${stage} recovery replays the original receipt and preserves its attempt identity`,async()=>{
+  const f=fixture({stage});Object.assign(f.snapshot,{schemaVersion:4,runner:runnerIdentity()});f.refreshManifest();
+  if(stage==='JUDGE')Object.assign(f.documents.get(f.task.dependsOn),{caseId:f.task.caseId,role:f.task.role,repeat:f.task.repeat});
+  await recoverReceivedAnswers(f.runId,f.io);
+  const output=f.documents.get(f.task.id);assert.equal(output.evaluation.runner,'promptfoo');assert.equal(output.evaluation.attemptId,f.source.id);
+  assert.equal(f.attempts[1].modelCall,false);assert.equal(f.entries.length,0);
+});
+
+test('a worker trace-write interruption preserves the exact receipt for explicit resume',async()=>{
+  assert.equal(typeof worker.processTask,'function');
+  const f=fixture();Object.assign(f.snapshot,{schemaVersion:4,runner:runnerIdentity()});f.refreshManifest();
+  Object.assign(f.task,{attemptId:f.source.id,owner:'worker',status:'RUNNING'});let writes=0,calls=0;
+  f.io.store.heartbeat=async()=>true;
+  f.io.store.finish=async()=>assert.fail('Interrupted trace must not commit an accepted output');
+  f.io.store.fail=async(task,error,retry,trace)=>{
+    assert.equal(retry.retry,false,'received answer cannot be retried');
+    Object.assign(f.source,{status:'FAILED',trace,error:{code:error.code,message:error.message}});f.task.status='FAILED';
+  };
+  const journal={...f.io.journal,persistResponse:async(task,trace)=>{
+    assert.deepEqual(trace,f.entry.trace);return{digest:f.entry.digest};
+  }};
+  await worker.processTask(f.task,{store:f.io.store,loadArtifact:f.io.loadArtifact,journal,
+    call:async()=>{calls++;return{text:JSON.stringify(f.response),raw:f.trace.raw,requestId:f.trace.requestId,latencyMs:f.trace.latencyMs,usage:f.trace.usage};},
+    writeArtifact:async(kind,id,trace)=>{
+      if(++writes===1)throw Object.assign(new Error('First trace write interrupted'),{code:'ECONNRESET'});
+      return f.save(`unit/fallback/${id}`,trace);
+    }});
+  assert.equal(calls,1);assert.equal(writes,2);
+  await recoverReceivedAnswers(f.runId,f.io);
+  assert.equal(f.documents.get(f.task.id).response.reply,f.response.reply);assert.equal(f.attempts[1].modelCall,false);
 });
 
 test('a malformed tested model answer remains the original measured format failure',async()=>{

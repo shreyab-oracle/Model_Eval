@@ -3,98 +3,110 @@ import {pathToFileURL} from 'node:url';
 import {repository} from '../db/repository.mjs';
 import {config,safeError} from '../config.mjs';
 import {closePool} from '../db/pool.mjs';
-import {modelInput} from '../domain/policy.mjs';
-import {parseJSON} from '../domain/checks.mjs';
 import {assertFrozenEngine} from '../domain/version.mjs';
-import {judgeInput,validateJudge} from '../domain/judge.mjs';
 import {chat,chatBody} from '../oracle/genai.mjs';
 import {digest} from '../domain/policy.mjs';
 import {putJSON,getJSON} from '../oracle/storage.mjs';
 import {retryDisposition} from './task-policy.mjs';
-import {writeReport} from './runs.mjs';
+import {writeReport,isCurrentEvaluation} from './runs.mjs';
+import {assertOptimizer} from '../optimization/bridge.mjs';
 import {createRetest} from './prompts.mjs';
 import {optimizePrompt} from '../optimization/engine.mjs';
 import {createAwakeGuard} from './awake.mjs';
-import {settingsForRole} from '../domain/model-settings.mjs';
-import {observeModelAnswer} from './model-answer.mjs';
+import {evaluateTask} from '../evaluation/task.mjs';
 import {responseJournal} from './response-journal.mjs';
 import {assertExecutionProtocol} from './execution-protocol.mjs';
 
 const log=(event,details)=>console.error(JSON.stringify({at:new Date().toISOString(),event,...details}));
-export function parseJudgeAssessment(text,response){
-  try{return validateJudge(parseJSON(text),response);}
-  catch(error){throw Object.assign(error,{code:'INVALID_JUDGE_ASSESSMENT'});}
-}
 export function responseRetryDisposition(task,error,{received=false,persistedTrace=false}={}){
   if(task.stage==='PROPOSE'||(received&&(!persistedTrace||error.code!=='INVALID_JUDGE_ASSESSMENT')))return{retry:false,delayMs:0};
   return retryDisposition(error,task.attempts,task.stage);
 }
 
-async function processTask(task){
-  let alive=true,response,trace,receipt,requestBody,endpoint,heartbeatError,heartbeatBusy=false;
+export async function processTask(task,{store=repository,loadArtifact=getJSON,writeArtifact=putJSON,journal=responseJournal,call=chat}={}){
+  let alive=true,response,trace,receipt,receivedTrace,requestBody,endpoint,heartbeatError,heartbeatBusy=false;
   const controller=new AbortController();
   const heartbeat=setInterval(async()=>{
     if(heartbeatBusy||!alive)return;heartbeatBusy=true;
-    try{if(!await repository.heartbeat(task)){alive=false;controller.abort();}}
+    try{if(!await store.heartbeat(task)){alive=false;controller.abort();}}
     catch(error){heartbeatError=error;alive=false;controller.abort();log('lease-heartbeat-failed',{taskId:task.id,error:safeError(error)});}
     finally{heartbeatBusy=false;}
   },30000);heartbeat.unref();
   const started=performance.now();
   try{
-    const run=await repository.run(task.runId),manifest=await repository.doc(run.manifestId),snapshot=await getJSON(manifest.artifact);
+    const run=await store.run(task.runId),manifest=await store.doc(run.manifestId),snapshot=await loadArtifact(manifest.artifact);
     const source=task.stage==='PROPOSE'||task.stage==='RETEST'?snapshot.source:snapshot;assertFrozenEngine(source);assertExecutionProtocol(source);
     if(task.stage==='PROPOSE'){
       if(snapshot.optimizer?.name!=='GEPA')throw new Error('Unsupported prompt optimizer; create a GEPA improvement job');
       const value=await optimizePrompt(snapshot,task,{isAlive:()=>alive&&!stopping,signal:controller.signal});
-      await repository.finish(task,{id:task.id,kind:'PROPOSAL',parentId:task.runId,value},{latencyMs:Math.round(performance.now()-started),callAttempts:value.callAttempts,trace:value.artifact});return;
+      await store.finish(task,{id:task.id,kind:'PROPOSAL',parentId:task.runId,value},{latencyMs:Math.round(performance.now()-started),callAttempts:value.callAttempts,trace:value.artifact});return;
     }
     if(task.stage==='RETEST'){
-      const proposal=await repository.doc(task.payload.proposalId);if(!proposal)throw new Error('Proposal missing');
-      if(proposal.changed===false){await repository.finish(task,{id:task.id,kind:'RETEST_LINK',parentId:proposal.id,value:{skipped:true,reason:'No acceptable prompt improvement; original prompt retained.'}},{modelCall:false});return;}
+      const proposal=await store.doc(task.payload.proposalId);if(!proposal)throw new Error('Proposal missing');
+      if(proposal.changed===false){await store.finish(task,{id:task.id,kind:'RETEST_LINK',parentId:proposal.id,value:{skipped:true,reason:'No acceptable prompt improvement; original prompt retained.'}},{modelCall:false});return;}
       const link=await createRetest(snapshot,proposal,task.runId);if(!alive)throw Object.assign(new Error('Worker lease lost'),{code:'LEASE_LOST'});
-      await repository.finish(task,{id:task.id,kind:'RETEST_LINK',parentId:proposal.id,value:link},{latencyMs:Math.round(performance.now()-started),modelCall:false},{startChildRun:link.runId});return;
+      await store.finish(task,{id:task.id,kind:'RETEST_LINK',parentId:proposal.id,value:link},{latencyMs:Math.round(performance.now()-started),modelCall:false},{startChildRun:link.runId});return;
     }
-    let messages,modelId,mode,settings,kind,value;
-    const c=snapshot.dataset.cases.find(c=>c.id===task.caseId);if(!c)throw new Error('Frozen case missing');
-    if(task.stage==='GENERATE'){messages=modelInput(c,snapshot.prompt,snapshot.policy);modelId=snapshot.models[task.role];mode=snapshot.modes[task.role];settings=settingsForRole(snapshot,task.role);kind='OUTPUT';}
-    else if(task.stage==='JUDGE'){const output=await repository.doc(task.payload.outputId);if(!output)throw new Error('Tested model output missing');messages=judgeInput(c,output.response,task.assessment,snapshot.policy,snapshot.judgeTemplates);modelId=snapshot.models.judge;mode=snapshot.modes.judge;settings=settingsForRole(snapshot,'judge');kind='JUDGE';}
-    else throw new Error(`Unknown task stage: ${task.stage}`);
-    requestBody=chatBody({modelId,mode,messages,settings,compartmentId:source.compartmentId});endpoint=source.genaiEndpoint;
-    response=await chat({modelId,mode,messages,settings,compartmentId:source.compartmentId,endpoint:source.genaiEndpoint});
-    const received={taskId:task.id,attemptId:task.attemptId,stage:task.stage,modelId,endpoint,requestBody,requestDigest:digest(requestBody),requestId:response.requestId,latencyMs:response.latencyMs,usage:response.usage,raw:response.raw};
-    // The receipt reaches disk before storage-name allocation or any database work.
-    receipt=await responseJournal.persistResponse(task,received);
-    trace=await putJSON('traces',task.attemptId,received);
-    if(kind==='OUTPUT')value={caseId:task.caseId,role:task.role,repeat:task.repeat,...observeModelAnswer(c,response.text)};
-    else{const output=await repository.doc(task.payload.outputId);value={outputId:task.payload.outputId,assessment:task.assessment,caseId:task.caseId,role:task.role,repeat:task.repeat,assessmentResult:parseJudgeAssessment(response.text,output.response)};}
+    endpoint=source.genaiEndpoint;
+    const guard=async()=>{if(!alive||stopping||!await store.heartbeat(task))throw Object.assign(new Error('Task cancelled or worker lease lost'),{code:'LEASE_LOST'});};
+    const evaluated=await evaluateTask({snapshot,task,loadDocument:id=>store.doc(id),guard,
+      call:request=>{requestBody=chatBody(request);return call(request);},
+      onReceived:async(receivedResponse,request)=>{
+        response=receivedResponse;
+        const received={taskId:task.id,attemptId:task.attemptId,stage:task.stage,modelId:request.modelId,endpoint,requestBody,requestDigest:digest(requestBody),requestId:response.requestId,latencyMs:response.latencyMs,usage:response.usage,raw:response.raw};
+        receivedTrace=received;
+        // Journal the exact received answer before any assertion or remote write.
+        receipt=await journal.persistResponse(task,received);
+        trace=await writeArtifact('traces',task.attemptId,received);
+      }});
+    const kind=task.stage==='GENERATE'?'OUTPUT':'JUDGE',value={...evaluated.value,evaluation:evaluated.evaluation};
     if(!alive)throw Object.assign(new Error('Worker lease lost while request was in flight'),{code:'LEASE_LOST'});
-    await repository.finish(task,{id:task.id,kind,parentId:task.runId,value:{...value,trace,latencyMs:response.latencyMs,usage:response.usage,requestId:response.requestId}},{latencyMs:response.latencyMs,usage:response.usage,requestId:response.requestId,trace});
-    await responseJournal.clear(task.attemptId,{remoteCommitted:true,expectedDigest:receipt.digest}).catch(error=>log('receipt-cleanup-failed',{taskId:task.id,error:safeError(error)}));
+    await store.finish(task,{id:task.id,kind,parentId:task.runId,value:{...value,trace,latencyMs:response.latencyMs,usage:response.usage,requestId:response.requestId}},{latencyMs:response.latencyMs,usage:response.usage,requestId:response.requestId,trace});
+    await journal.clear(task.attemptId,{remoteCommitted:true,expectedDigest:receipt.digest}).catch(error=>log('receipt-cleanup-failed',{taskId:task.id,error:safeError(error)}));
   }catch(error){
     // Preserve the database/network cause instead of replacing it with the
     // secondary GEPA subprocess-cancelled symptom after a lost heartbeat.
     error=heartbeatError||error;
-    if(!trace&&requestBody)try{trace=await putJSON('error-traces',task.attemptId,{taskId:task.id,attemptId:task.attemptId,requestBody,requestDigest:digest(requestBody),endpoint,raw:response?.raw||error.raw||null,latencyMs:Math.round(performance.now()-started),error:safeError(error)});}catch{}
+    // Recovery must see the identical received trace, even when its first cloud
+    // write failed. Attempt.error already preserves the processing diagnostic.
+    if(!trace&&requestBody)try{trace=receivedTrace?
+      await writeArtifact('traces',task.attemptId,receivedTrace):
+      await writeArtifact('error-traces',task.attemptId,{taskId:task.id,attemptId:task.attemptId,requestBody,requestDigest:digest(requestBody),endpoint,raw:error.raw||null,latencyMs:Math.round(performance.now()-started),error:safeError(error)});}catch{}
     // A received answer is replayed from evidence; it must never trigger another
     // model call because its database or storage commit was interrupted.
     const retry=responseRetryDisposition(task,error,{received:!!response,persistedTrace:!!trace});
-    const recorded=await repository.fail(task,error,retry,trace).then(()=>true).catch(e=>{log('attempt-persistence-failed',{taskId:task.id,error:safeError(e)});return false;});
-    if(recorded&&trace&&receipt&&error.code==='INVALID_JUDGE_ASSESSMENT')await responseJournal.clear(task.attemptId,{remoteCommitted:true,expectedDigest:receipt.digest}).catch(e=>log('receipt-cleanup-failed',{taskId:task.id,error:safeError(e)}));
+    const recorded=await store.fail(task,error,retry,trace).then(()=>true).catch(e=>{log('attempt-persistence-failed',{taskId:task.id,error:safeError(e)});return false;});
+    if(recorded&&trace&&receipt&&error.code==='INVALID_JUDGE_ASSESSMENT')await journal.clear(task.attemptId,{remoteCommitted:true,expectedDigest:receipt.digest}).catch(e=>log('receipt-cleanup-failed',{taskId:task.id,error:safeError(e)}));
     log('task-failed',{taskId:task.id,error:safeError(error)});
   }finally{clearInterval(heartbeat);}
 }
 let stopping=false;
 function stopWorker(){stopping=true;}
+export async function eligibleWorkerRuns(runs,{loadManifest=id=>repository.doc(id),cache=new Map()}={}){
+  const eligible=[];
+  for(const run of runs){
+    if(run.kind==='diagnostic')continue;
+    if(!cache.has(run.manifestId)){
+      const manifest=await loadManifest(run.manifestId),snapshot=manifest?.snapshot;
+      let current=isCurrentEvaluation(snapshot?.source||snapshot);
+      if(current&&snapshot.optimizer)try{assertOptimizer(snapshot);}catch{current=false;}
+      cache.set(run.manifestId,current);
+    }
+    if(cache.get(run.manifestId))eligible.push(run);
+  }
+  return eligible;
+}
 export async function workerLoop({once=false,reports=true}={}){
-  const owner=randomUUID(),inflight=new Set(),awake=createAwakeGuard({onError:error=>log('sleep-prevention-unavailable',{error:safeError(error)})});
+  const owner=randomUUID(),inflight=new Set(),compatibleManifests=new Map(),awake=createAwakeGuard({onError:error=>log('sleep-prevention-unavailable',{error:safeError(error)})});
   try{
   do{
     try{
-      await repository.settle();
-      const runs=await repository.runs();awake.setActive(inflight.size>0||runs.some(r=>r.status==='RUNNING'));
+      const runs=await eligibleWorkerRuns(await repository.runs({worker:true}),{cache:compatibleManifests}),runIds=runs.map(r=>r.id);
+      await repository.settle({runIds});
+      awake.setActive(inflight.size>0||runs.some(r=>r.status==='RUNNING'));
       if(reports)for(const run of runs.filter(r=>r.status==='COMPLETED'&&r.kind!=='improvement'&&!r.reportId))await writeReport(run.id).catch(e=>log('report-failed',{runId:run.id,error:safeError(e)}));
-      while(!stopping&&inflight.size<config.concurrency){const task=await repository.claim(owner,config.leaseSeconds);if(!task)break;awake.setActive(true);const p=processTask(task).finally(()=>inflight.delete(p));inflight.add(p);}
-      if(once){await Promise.all(inflight);await repository.settle();return;}
+      while(!stopping&&inflight.size<config.concurrency){const task=await repository.claim(owner,config.leaseSeconds,{runIds});if(!task)break;awake.setActive(true);const p=processTask(task).finally(()=>inflight.delete(p));inflight.add(p);}
+      if(once){await Promise.all(inflight);await repository.settle({runIds});return;}
     }catch(e){if(!inflight.size)awake.setActive(false);log('worker-error',{error:safeError(e)});}
     await Promise.race([new Promise(r=>setTimeout(r,1500)),...inflight]);
   }while(!stopping);

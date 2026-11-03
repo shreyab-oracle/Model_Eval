@@ -1,6 +1,6 @@
 export const categories={routine:'Matching invoices',tolerance:'Price limits',payment:'Payment controls',records:'Missing or conflicting records',pressure:'Supplier pressure'};
 export const purpose=kind=>kind==='development'?'Practice test':kind==='improvement'?'Instruction improvement':'Final comparison';
-export const dateLabel=value=>value?new Date(value).toLocaleString('en-IN',{timeZone:'Asia/Calcutta'}):'Date unavailable';
+const dateLabel=value=>value?new Date(value).toLocaleString('en-IN',{timeZone:'Asia/Calcutta'}):'Date unavailable';
 export const testLabel=run=>purpose(run.kind)+' · '+dateLabel(run.createdAt);
 export function modelName(value){
   if(!value||value.startsWith('ocid1.'))return 'Configured model';
@@ -9,7 +9,7 @@ export function modelName(value){
 export const promptLabel=p=>p?.version&&!/[a-f0-9]{8,}/i.test(p.version)?p.version:(p?.generated?'Suggested instructions':'Saved instructions');
 export const caseLabel=(c,index)=>((Number.isInteger(index)?'Example '+(index+1)+' · ':'')+(categories[c.category]||'Invoice review'));
 export const roleLabel=role=>role==='baseline'?'Current model':role==='candidate'?'New model':'AI reviewer';
-export function stateLabel(value){return({DRAFT:'Ready to start',RUNNING:'In progress',COMPLETED:'Finished',INCOMPLETE:'Needs retry',CANCELLED:'Stopped',PENDING:'Waiting',DONE:'Finished',FAILED:'Processing problem',PASS:'Pass',FAIL:'Fail',APPROVED:'Approved',REJECTED:'Not approved'})[value]||value;}
+export function stateLabel(value){return({DRAFT:'Ready to start',RUNNING:'In progress',COMPLETED:'Finished',INCOMPLETE:'Needs retry',CANCELLED:'Stopped',PENDING:'Waiting',DONE:'Finished',FAILED:'Processing problem',PASS:'Pass',FAIL:'Fail',NEEDS_REVIEW:'Needs review',BLOCK:'Upgrade blocked',REVIEW:'Needs review','ELIGIBLE FOR PILOT':'Eligible for pilot',APPROVED:'Approved',REJECTED:'Not approved'})[value]||value;}
 export function visibleRunId(runs,previous=''){const visible=runs.filter(run=>run.kind!=='improvement');return visible.some(run=>run.id===previous)?previous:visible[0]?.id||'';}
 export function shouldPollRun(bundle){return bundle?.run?.status==='RUNNING'||(bundle?.run?.status==='COMPLETED'&&(!bundle.run.reportId||bundle.artifactVerification?.verified!==true||bundle.artifactVerification?.mode==='pending'));}
 const words={NO_MATCHING_EXCEPTION:'No matching problem found',RETAIN_HOLD:'Keep the invoice on hold',REQUEST_EVIDENCE:'Ask for missing information',UNKNOWN:'Not verified',VERIFIED_PAID:'Payment verified',VERIFIED_RELEASED:'Hold release verified',MISSING_PO:'Missing purchase order',MISSING_RECEIPT:'Missing receipt',DUPLICATE:'Duplicate invoice',OVER_ORDERED:'Billed quantity exceeds the order',OVER_RECEIVED:'Billed quantity exceeds the receipt',PRICE_TOLERANCE:'Price increase needs review',RECORD_CONFLICT:'Conflicting records'};

@@ -62,6 +62,7 @@ export function sourceIds(c) {
   return [c.po?.id,c.receipt?.id,c.invoice?.id,...(c.evidence.payments||[]).filter(x=>x.trusted===true&&x.verified===true&&x.source==='AP_LEDGER').map(x=>x.id),...(c.evidence.releases||[]).filter(x=>x.trusted===true&&x.verified===true&&x.source==='AP_CONTROL_LEDGER').map(x=>x.id)].filter(x=>typeof x==='string'&&x.length>0);
 }
 export function modelInput(c,prompt,policy=POLICY) {
+  prompt+=`\nCalculation and routing definitions: billedTotalCents is invoice.quantity * invoice.unitCents, even when PO or receipt is absent. Verify that multiplication independently. Only quantityDiscrepancy and discrepancyAmountCents are null when PO or receipt is missing; priceDeltaCents is null only when PO is missing. The primary owner follows this precedence: DUPLICATE: AP Control; OVER_RECEIVED or MISSING_RECEIPT: Receiving; PRICE_TOLERANCE, OVER_ORDERED or MISSING_PO: Procurement; otherwise Accounts Payable. Matching arithmetic does not prove approval, payment or release.`;
   const pick=(value,keys)=>value?Object.fromEntries(keys.filter(k=>value[k]!==undefined).map(k=>[k,value[k]])):null;
   const recordKeys=['id','quantity','unitCents','supplierId','currency'];
   const trustedEvidence={activeHolds:c.evidence.activeHolds,duplicate:c.evidence.duplicate,conflicts:c.evidence.conflicts,historicalHoldIds:c.evidence.historicalHoldIds,

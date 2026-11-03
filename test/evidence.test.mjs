@@ -12,6 +12,8 @@ import {chatBody} from '../src/oracle/genai.mjs';
 import {checkOutput} from '../src/domain/checks.mjs';
 import {EXECUTION_PROTOCOL_VERSION} from '../src/services/execution-protocol.mjs';
 import {receiptDigest} from '../src/services/response-journal.mjs';
+import {runnerIdentity} from '../src/evaluation/version.mjs';
+import {evaluateTask} from '../src/evaluation/task.mjs';
 function evidenceFixture({gemini=false}={}){
   const dataset=generateDataset({kind:'development'});dataset.cases=dataset.cases.slice(0,1);const c=dataset.cases[0];
   const snapshot={executionProtocolVersion:EXECUTION_PROTOCOL_VERSION,engineDigest:ENGINE_DIGEST,judgeTemplates:judgeTemplates(POLICY),dataset,runId:'UNIT-ONLY',datasetId:'DATASET',datasetDigest:digest(dataset),prompt:INITIAL_PROMPT,promptDigest:digest(INITIAL_PROMPT),policy:POLICY,policyDigest:digest(POLICY),models:{baseline:'b',candidate:'c',judge:'j'},modes:{baseline:'ON_DEMAND',candidate:'ON_DEMAND',judge:'ON_DEMAND'},settings:{maxCompletionTokens:2048,verbosity:'MEDIUM'},judgeSettings:{maxCompletionTokens:2048,verbosity:'MEDIUM'},compartmentId:'unit-compartment',genaiEndpoint:'https://inference.generativeai.us-chicago-1.oci.oraclecloud.com'};snapshot.judgeTemplateDigest=digest(snapshot.judgeTemplates);
@@ -84,3 +86,17 @@ test('evidence verification reconstructs Gemini candidate and GPT judge requests
 test('a missing or corrupt required object prevents authoritative eligibility',async()=>{const f=evidenceFixture();f.artifacts.delete(f.b.judges[0].trace.key);await assert.rejects(()=>verifyBundle(f.b,f.io),/missing/);const g=evidenceFixture();g.artifacts.get('report').inputDigest='tampered';await assert.rejects(()=>verifyBundle(g.b,g.io),/digest/);});
 test('wrong judge slot or missing planned task fails evidence verification',async()=>{const f=evidenceFixture();f.b.judges[1].assessment=0;await assert.rejects(()=>verifyBundle(f.b,f.io),/slot/);const g=evidenceFixture();g.b.tasks.pop();await assert.rejects(()=>verifyBundle(g.b,g.io),/task set/);});
 test('evaluator changes cannot be mixed into a frozen resumed run',async()=>{const f=evidenceFixture();f.b.snapshot.engineDigest='old-engine';await assert.rejects(()=>verifyBundle(f.b,f.io),/engine/i);});
+
+test('new evidence replays every Promptfoo assertion from saved raw responses and rejects altered runner results',async()=>{
+  const f=evidenceFixture();Object.assign(f.b.snapshot,{schemaVersion:4,runner:runnerIdentity()});
+  f.artifacts.set('manifest',structuredClone(f.b.snapshot));f.b.manifest.artifact.digest=digest(f.b.snapshot);
+  for(const output of [...f.b.outputs,...f.b.judges]){
+    output.parentId=f.b.run.id;
+    const trace=f.artifacts.get(output.trace.key),task=f.b.tasks.find(t=>t.id===output.id);
+    const evaluated=await evaluateTask({snapshot:f.b.snapshot,task:{...task,runId:f.b.run.id,attemptId:trace.attemptId},loadDocument:async id=>f.b.outputs.find(o=>o.id===id),receivedResponse:{text:trace.raw.chatResponse.choices[0].message.content[0].text,raw:trace.raw}});
+    output.evaluation=evaluated.evaluation;
+  }
+  assert.equal(await verifyBundle(f.b,f.io),true);
+  f.b.outputs[0].evaluation.success=false;
+  await assert.rejects(()=>verifyBundle(f.b,f.io),/Promptfoo assertion evidence/i);
+});

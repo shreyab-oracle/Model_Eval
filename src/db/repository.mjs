@@ -15,6 +15,15 @@ async function insertDoc(c,{id=randomUUID(),kind,parentId=null,version=null,valu
   await c.execute('INSERT INTO AIE_DOCUMENTS(id,kind,parent_id,version_name,digest,payload) VALUES(:id,:kind,:parentId,:version,:hash,:payload)',{id,kind,parentId,version,hash,payload:canonical(value)});return id;
 }
 const sameTrace=(a,b)=>typeof a?.key==='string'&&a.key.length>0&&typeof a.digest==='string'&&a.digest.length>0&&a.key===b?.key&&a.digest===b?.digest;
+function runScope(runIds){
+  if(runIds===undefined)return{empty:false,binds:{},where:()=> '1=1'};
+  if(!Array.isArray(runIds)||runIds.some(id=>typeof id!=='string'||!id||id.length>64))throw new Error('A valid worker run scope is required');
+  // JSON_TABLE cannot appear beneath SELECT FOR UPDATE in Oracle. Bind the
+  // compatible run IDs directly, splitting lists below Oracle's 1,000 limit.
+  const ids=[...new Set(runIds)],binds=Object.fromEntries(ids.map((id,i)=>[`eligibleRun${i}`,id])),groups=[];
+  for(let i=0;i<ids.length;i+=900)groups.push(ids.slice(i,i+900).map((_,j)=>`:eligibleRun${i+j}`).join(','));
+  return{empty:ids.length===0,binds,where:column=>`(${groups.map(group=>`${column} IN (${group})`).join(' OR ')})`};
+}
 async function recoverReceivedAnswer(c,{taskId,sourceAttemptId,document,handlingVersion,journalDigest,resumeRun=false}){
   const reject=message=>{throw Object.assign(new Error(message),{code:'RECEIVED_ANSWER_RECOVERY_REJECTED'});};
   const recoveryKind='LOCAL_JOURNAL';
@@ -61,7 +70,9 @@ export const repository={
   async doc(id){return withConnection(async c=>readDoc((await c.execute('SELECT * FROM AIE_DOCUMENTS WHERE id=:id',{id})).rows[0]),{readOnly:true});},
   async docs(kind,parentId){return withConnection(async c=>(await c.execute('SELECT * FROM AIE_DOCUMENTS WHERE kind=:kind AND (:parent IS NULL OR parent_id=:parent) ORDER BY created_at DESC',{kind,parent:parentId||null})).rows.map(readDoc),{readOnly:true});},
   async run(id){return withConnection(async c=>readRun((await c.execute('SELECT * FROM AIE_RUNS WHERE id=:id',{id})).rows[0]),{readOnly:true});},
-  async runs(){return withConnection(async c=>(await c.execute("SELECT * FROM AIE_RUNS WHERE run_kind<>'diagnostic' ORDER BY created_at DESC FETCH FIRST 100 ROWS ONLY")).rows.map(readRun),{readOnly:true});},
+  async runs({worker=false}={}){return withConnection(async c=>(await c.execute(worker?
+    "SELECT r.* FROM AIE_RUNS r WHERE r.run_kind<>'diagnostic' AND (r.status='RUNNING' OR EXISTS (SELECT 1 FROM AIE_TASKS t WHERE t.run_id=r.id AND t.status='RUNNING') OR (r.status='COMPLETED' AND r.report_id IS NULL AND r.run_kind<>'improvement')) ORDER BY r.created_at":
+    "SELECT * FROM AIE_RUNS WHERE run_kind<>'diagnostic' ORDER BY created_at DESC FETCH FIRST 100 ROWS ONLY")).rows.map(readRun),{readOnly:true});},
   async createRun({id,manifestId,kind,tasks,live=true}){return withConnection(async c=>{
     await c.execute("INSERT INTO AIE_RUNS(id,manifest_id,status,run_kind,live) VALUES(:id,:manifestId,'DRAFT',:kind,:live)",{id,manifestId,kind,live:live?1:0});
     const d=getDriver();
@@ -78,8 +89,8 @@ export const repository={
     await c.execute("UPDATE AIE_TASKS SET status='PENDING',attempts=0,retry_cycle=retry_cycle+1,owner=NULL,lease_until=NULL,due_at=SYSTIMESTAMP,error=NULL WHERE run_id=:id AND status='FAILED'",{id});await c.commit();
   });},
   async tasks(runId){return withConnection(async c=>(await c.execute('SELECT * FROM AIE_TASKS WHERE run_id=:id ORDER BY created_at,id',{id:runId})).rows.map(readTask),{readOnly:true});},
-  async claim(owner,leaseSeconds=240){return withConnection(async c=>{
-    const r=await c.execute("SELECT t.* FROM AIE_TASKS t WHERE EXISTS (SELECT 1 FROM AIE_RUNS r WHERE r.id=t.run_id AND r.status='RUNNING') AND ((t.status='PENDING' AND t.due_at<=SYSTIMESTAMP) OR (t.status='RUNNING' AND t.lease_until<SYSTIMESTAMP AND t.stage='RETEST')) AND (t.depends_on IS NULL OR EXISTS (SELECT 1 FROM AIE_TASKS d WHERE d.id=t.depends_on AND d.status='DONE')) AND t.attempts<3 ORDER BY t.created_at,t.id FOR UPDATE SKIP LOCKED",[],{resultSet:true,prefetchRows:0,fetchArraySize:1});
+  async claim(owner,leaseSeconds=240,{runIds}={}){const scope=runScope(runIds);if(scope.empty)return null;return withConnection(async c=>{
+    const r=await c.execute(`SELECT t.* FROM AIE_TASKS t WHERE ${scope.where('t.run_id')} AND EXISTS (SELECT 1 FROM AIE_RUNS r WHERE r.id=t.run_id AND r.status='RUNNING') AND ((t.status='PENDING' AND t.due_at<=SYSTIMESTAMP) OR (t.status='RUNNING' AND t.lease_until<SYSTIMESTAMP AND t.stage='RETEST')) AND (t.depends_on IS NULL OR EXISTS (SELECT 1 FROM AIE_TASKS d WHERE d.id=t.depends_on AND d.status='DONE')) AND t.attempts<3 ORDER BY t.created_at,t.id FOR UPDATE SKIP LOCKED`,scope.binds,{resultSet:true,prefetchRows:0,fetchArraySize:1});
     const row=await r.resultSet.getRow();await r.resultSet.close();if(!row){await c.rollback();return null;}
     const task=readTask(row);
     if(task.status==='RUNNING'&&!canAutoReclaim(task)){await c.rollback();return null;}
@@ -102,13 +113,14 @@ export const repository={
     await c.execute("UPDATE AIE_ATTEMPTS SET status='FAILED',result=:result,finished_at=SYSTIMESTAMP WHERE id=:id AND owner=:owner AND status='RUNNING'",{id:task.attemptId,owner:task.owner,result});
     await c.execute("UPDATE AIE_TASKS SET status=:status,error=:error,owner=NULL,lease_until=NULL,due_at=SYSTIMESTAMP+NUMTODSINTERVAL(:delay,'SECOND') WHERE id=:id AND owner=:owner AND status='RUNNING' AND lease_until>SYSTIMESTAMP",{id:task.id,owner:task.owner,status:retry?'PENDING':'FAILED',error:JSON.stringify(safe),delay:delayMs/1000});await c.commit();
   });},
-  async settle(){return withConnection(async c=>{
-    await c.execute("UPDATE AIE_ATTEMPTS SET status='UNCERTAIN',finished_at=SYSTIMESTAMP WHERE status='RUNNING' AND task_id IN (SELECT id FROM AIE_TASKS WHERE stage IN ('PROPOSE','GENERATE','JUDGE') AND status='RUNNING' AND lease_until<SYSTIMESTAMP)");
-    await c.execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE stage='PROPOSE' AND status='RUNNING' AND lease_until<SYSTIMESTAMP",{e:JSON.stringify({code:'GEPA_INTERRUPTED',message:'Prompt search interrupted; explicit resume required before additional model requests'})});
-    await c.execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE stage IN ('GENERATE','JUDGE') AND status='RUNNING' AND lease_until<SYSTIMESTAMP",{e:JSON.stringify({code:'EVALUATION_OUTCOME_UNCERTAIN',message:'Model request outcome is uncertain after interruption; reconcile the original response before resuming'})});
-    await c.execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE status='RUNNING' AND lease_until<SYSTIMESTAMP AND attempts>=3",{e:JSON.stringify({code:'ATTEMPTS_EXHAUSTED',message:'Worker interrupted repeatedly; explicit resume required'})});
-    await c.execute("UPDATE AIE_RUNS r SET status='COMPLETED',updated_at=SYSTIMESTAMP WHERE r.status='RUNNING' AND NOT EXISTS(SELECT 1 FROM AIE_TASKS t WHERE t.run_id=r.id AND t.status<>'DONE')");
-    await c.execute("UPDATE AIE_RUNS r SET status='INCOMPLETE',updated_at=SYSTIMESTAMP WHERE r.status='RUNNING' AND EXISTS(SELECT 1 FROM AIE_TASKS f WHERE f.run_id=r.id AND f.status='FAILED') AND NOT EXISTS(SELECT 1 FROM AIE_TASKS t WHERE t.run_id=r.id AND t.status='RUNNING') AND NOT EXISTS(SELECT 1 FROM AIE_TASKS p WHERE p.run_id=r.id AND p.status='PENDING' AND (p.depends_on IS NULL OR EXISTS(SELECT 1 FROM AIE_TASKS d WHERE d.id=p.depends_on AND d.status='DONE')))");await c.commit();
+  async settle({runIds}={}){const scope=runScope(runIds);if(scope.empty)return;return withConnection(async c=>{
+    const execute=(sql,binds={},column='run_id')=>c.execute(`${sql} AND ${scope.where(column)}`,{...scope.binds,...binds});
+    await c.execute(`UPDATE AIE_ATTEMPTS SET status='UNCERTAIN',finished_at=SYSTIMESTAMP WHERE status='RUNNING' AND task_id IN (SELECT id FROM AIE_TASKS WHERE stage IN ('PROPOSE','GENERATE','JUDGE') AND status='RUNNING' AND lease_until<SYSTIMESTAMP AND ${scope.where('run_id')})`,scope.binds);
+    await execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE stage='PROPOSE' AND status='RUNNING' AND lease_until<SYSTIMESTAMP",{e:JSON.stringify({code:'GEPA_INTERRUPTED',message:'Prompt search interrupted; explicit resume required before additional model requests'})});
+    await execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE stage IN ('GENERATE','JUDGE') AND status='RUNNING' AND lease_until<SYSTIMESTAMP",{e:JSON.stringify({code:'EVALUATION_OUTCOME_UNCERTAIN',message:'Model request outcome is uncertain after interruption; reconcile the original response before resuming'})});
+    await execute("UPDATE AIE_TASKS SET status='FAILED',owner=NULL,lease_until=NULL,error=:e WHERE status='RUNNING' AND lease_until<SYSTIMESTAMP AND attempts>=3",{e:JSON.stringify({code:'ATTEMPTS_EXHAUSTED',message:'Worker interrupted repeatedly; explicit resume required'})});
+    await execute("UPDATE AIE_RUNS r SET status='COMPLETED',updated_at=SYSTIMESTAMP WHERE r.status='RUNNING' AND NOT EXISTS(SELECT 1 FROM AIE_TASKS t WHERE t.run_id=r.id AND t.status<>'DONE')",{},'r.id');
+    await execute("UPDATE AIE_RUNS r SET status='INCOMPLETE',updated_at=SYSTIMESTAMP WHERE r.status='RUNNING' AND EXISTS(SELECT 1 FROM AIE_TASKS f WHERE f.run_id=r.id AND f.status='FAILED') AND NOT EXISTS(SELECT 1 FROM AIE_TASKS t WHERE t.run_id=r.id AND t.status='RUNNING') AND NOT EXISTS(SELECT 1 FROM AIE_TASKS p WHERE p.run_id=r.id AND p.status='PENDING' AND (p.depends_on IS NULL OR EXISTS(SELECT 1 FROM AIE_TASKS d WHERE d.id=p.depends_on AND d.status='DONE')))",{},'r.id');await c.commit();
   });},
   async attempts(runId){return withConnection(async c=>(await c.execute('SELECT a.* FROM AIE_ATTEMPTS a JOIN AIE_TASKS t ON t.id=a.task_id WHERE t.run_id=:id ORDER BY a.started_at',{id:runId})).rows.map(readAttempt),{readOnly:true});},
   async setReport(runId,docId){return withConnection(async c=>{await c.execute('UPDATE AIE_RUNS SET report_id=:doc,updated_at=SYSTIMESTAMP WHERE id=:id',{id:runId,doc:docId});await c.commit();});}

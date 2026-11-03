@@ -7,7 +7,7 @@ import {config,safeError} from '../config.mjs';
 import {route} from './routes.mjs';
 import {authorizeMutation} from './security.mjs';
 const dist=path.resolve(fileURLToPath(new URL('../../dist',import.meta.url)));
-export function makeServer(){
+function makeServer(){
   const token=process.env.LOCAL_API_TOKEN||randomBytes(32).toString('hex');
   const allowedOrigins=[config.uiOrigin,`http://127.0.0.1:${config.port}`,`http://localhost:${config.port}`];
   return http.createServer(async(req,res)=>{

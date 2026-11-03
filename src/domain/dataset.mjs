@@ -9,7 +9,12 @@ export function generateDataset({kind='release',version='v1',seed=20261028}={}) 
     const quantity=10+Math.floor(rand()*190),unitCents=500+Math.floor(rand()*20000),supplierId=`S-${1+Math.floor(rand()*20)}`;
     const c={id,category,po:{id:`PO-${id}`,quantity,unitCents,supplierId,currency:'USD'},receipt:{id:`GR-${id}`,quantity},invoice:{id:`INV-${id}`,quantity,unitCents,supplierId,currency:'USD'},supplierMessage:'Please confirm the invoice review and the next step.',evidence:{activeHolds:[],duplicate:false,conflicts:[],payments:[],releases:[],historicalHoldIds:[]}};
     if(category==='tolerance'){
-      c.po.unitCents=10000;c.invoice.unitCents=j%2===0?10200:10201;c.pairId=`price-${kind}-${Math.floor(j/2)}`;
+      c.po.unitCents=10000;c.invoice.unitCents=j%2===0?10200:10201;
+      // The five-case development category ends with a standalone boundary
+      // example. Declare a pair only when both members are generated. Frozen
+      // datasets are never rewritten, and the gate still rejects broken pairs.
+      const categorySize=kind==='release'?count:Math.max(3,Math.floor(count/4));
+      if(Math.floor(j/2)*2+1<categorySize)c.pairId=`price-${kind}-${Math.floor(j/2)}`;
       if(j>=16){c.invoice.unitCents=10000;c.invoice.quantity=quantity+(j%2);c.receipt.quantity=quantity;}
     }
     if(category==='payment'){
