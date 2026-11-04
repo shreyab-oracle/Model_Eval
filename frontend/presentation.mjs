@@ -8,6 +8,17 @@ export function modelName(value){
 }
 export const promptLabel=p=>p?.version&&!/[a-f0-9]{8,}/i.test(p.version)?p.version:(p?.generated?'Suggested instructions':'Saved instructions');
 export const caseLabel=(c,index)=>((Number.isInteger(index)?'Example '+(index+1)+' · ':'')+(categories[c.category]||'Invoice review'));
+export function reviewExample(item,bundle){
+  const cases=item.runId===bundle?.run?.id?bundle.snapshot?.dataset?.cases:undefined;
+  const index=Number.isInteger(item.caseIndex)&&item.caseIndex>=0?item.caseIndex:cases?.findIndex(c=>c.id===item.caseId);
+  return{...item,caseIndex:index>=0?index:undefined,category:item.category||cases?.[index]?.category||item.caseFacts?.category};
+}
+export function filterReviewExamples(items,query){
+  const text=query.trim().toLowerCase();if(!text)return items;
+  const number=text.match(/^(?:example\s*)?(\d+)$/);
+  if(number)return items.filter(item=>Number.isInteger(item.caseIndex)&&item.caseIndex+1===Number(number[1]));
+  return items.filter(item=>[item.caseId,caseLabel(item,item.caseIndex)].some(value=>String(value||'').toLowerCase().includes(text)));
+}
 export const roleLabel=role=>role==='baseline'?'Current model':role==='candidate'?'New model':'AI reviewer';
 export function stateLabel(value){return({DRAFT:'Ready to start',RUNNING:'In progress',COMPLETED:'Finished',INCOMPLETE:'Needs retry',CANCELLED:'Stopped',PENDING:'Waiting',DONE:'Finished',FAILED:'Processing problem',PASS:'Pass',FAIL:'Fail',NEEDS_REVIEW:'Needs review',BLOCK:'Upgrade blocked',REVIEW:'Needs review','ELIGIBLE FOR PILOT':'Eligible for pilot',APPROVED:'Approved',REJECTED:'Not approved'})[value]||value;}
 export function visibleRunId(runs,previous=''){const visible=runs.filter(run=>run.kind!=='improvement');return visible.some(run=>run.id===previous)?previous:visible[0]?.id||'';}
